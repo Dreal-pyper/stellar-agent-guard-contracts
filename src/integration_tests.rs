@@ -17,7 +17,7 @@
 //!   approves) so admin calls can be enforced in the same env without key
 //!   material.
 
-use crate::types::{CheckResult, Error as GuardError, PolicyConfig};
+use crate::types::{CheckResult, Error as GuardError, PolicyConfig, ProtocolRule};
 use crate::{PolicyEngine, PolicyEngineClient};
 
 use ed25519_dalek::{Signer, SigningKey};
@@ -29,9 +29,24 @@ use soroban_sdk::xdr::{
     ScBytes, ScSymbol, ScVal, SorobanAddressCredentials, SorobanAuthorizationEntry,
     SorobanAuthorizedFunction, SorobanAuthorizedInvocation, SorobanCredentials, WriteXdr,
 };
-use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, FromVal, IntoVal, Symbol, Val};
+use soroban_sdk::{
+    contract, contractimpl, vec, Address, BytesN, Env, FromVal, IntoVal, Symbol, Val,
+};
+use std::format;
 
 const SIG_EXPIRATION_LEDGER: u32 = 6_000_000;
+
+/// A `ScVal::Symbol` built from a plain string (event names / map keys).
+fn symbol_val(s: &str) -> ScVal {
+    ScVal::Symbol(ScSymbol::try_from(std::vec::Vec::from(s)).unwrap())
+}
+
+/// Off-chain reproduction of the contract's key fingerprint (SPEC §9):
+/// `sha256(pubkey)[0..8]`, as the `ScVal::Bytes` an event data map carries.
+fn fingerprint(pubkey: &[u8; 32]) -> ScVal {
+    let digest = Sha256::digest(pubkey);
+    ScVal::Bytes(ScBytes::try_from(digest[..8].to_vec()).unwrap())
+}
 
 /// Number of `heartbeat` events published by the last contract invocation.
 fn heartbeat_event_count(env: &Env) -> usize {
@@ -364,6 +379,36 @@ impl Harness {
                 xdr::ContractEventBody::V0(v0) => v0.topics.get(1) == Some(&want),
             })
     }
+
+    /// The `(old, new)` key fingerprints carried by the most recent
+    /// `agent_rotated` event (SPEC §9), as raw `ScVal`s. Panics if the event
+    /// is absent or malformed.
+    fn agent_rotated_fingerprints(&self) -> (ScVal, ScVal) {
+        let event_name = symbol_val("event_agent_rotated");
+        for event in self.env.events().all().events().iter().rev() {
+            let xdr::ContractEventBody::V0(v0) = &event.body;
+            if v0.topics.first() != Some(&event_name) {
+                continue;
+            }
+            let ScVal::Map(Some(map)) = &v0.data else {
+                panic!("agent_rotated data is not a map");
+            };
+            let mut old = None;
+            let mut new = None;
+            for entry in &map.0 {
+                if entry.key == symbol_val("old_fingerprint") {
+                    old = Some(entry.val.clone());
+                } else if entry.key == symbol_val("new_fingerprint") {
+                    new = Some(entry.val.clone());
+                }
+            }
+            return (
+                old.expect("agent_rotated is missing old_fingerprint"),
+                new.expect("agent_rotated is missing new_fingerprint"),
+            );
+        }
+        panic!("no agent_rotated event was emitted");
+    }
 }
 
 // ── Scenarios ────────────────────────────────────────────────────────────
@@ -645,6 +690,24 @@ fn wrong_signature_is_rejected_by_host_crypto() {
 }
 
 #[test]
+fn rotate_agent_key_event_carries_old_and_new_fingerprints() {
+    let h = Harness::new();
+    let old_pk = h.agent.verifying_key().to_bytes();
+    let new_pk = SigningKey::from_bytes(&[11u8; 32])
+        .verifying_key()
+        .to_bytes();
+
+    // First rotation: the `old` fingerprint is the key set at `initialize`.
+    PolicyEngineClient::new(&h.env, &h.guard)
+        .rotate_agent_key(&BytesN::from_array(&h.env, &new_pk));
+
+    let (old_fp, new_fp) = h.agent_rotated_fingerprints();
+    assert_eq!(old_fp, fingerprint(&old_pk));
+    assert_eq!(new_fp, fingerprint(&new_pk));
+    assert_ne!(old_fp, new_fp, "old and new keys must be distinguishable");
+}
+
+#[test]
 fn rotated_agent_key_binds() {
     let mut h = Harness::new();
     let recv = h.recv.clone();
@@ -741,4 +804,161 @@ fn revoke_policy_is_instant_default_deny() {
     h.env.mock_all_auths();
     h.revoke_policy();
     h.transfer_expect_blocked(&recv, 5);
+}
+
+#[test]
+fn error_and_block_reason_round_trip() {
+    let all_errors = [
+        GuardError::Unauthorized,
+        GuardError::AlreadyInitialized,
+        GuardError::NotInitialized,
+        GuardError::InvalidConfig,
+        GuardError::InvalidAmount,
+        GuardError::AdminFrozen,
+        GuardError::HeartbeatExpired,
+        GuardError::NoPolicy,
+        GuardError::Paused,
+        GuardError::OutsideActiveWindow,
+        GuardError::AssetNotAllowed,
+        GuardError::RecipientNotAllowed,
+        GuardError::PerTxCapExceeded,
+        GuardError::WindowCapExceeded,
+        GuardError::ProtocolNotAllowed,
+        GuardError::FunctionNotAllowed,
+        GuardError::UnknownContract,
+        GuardError::SelfFunctionNotAllowed,
+        GuardError::CreateContractNotAllowed,
+    ];
+
+    for err in all_errors {
+        let reason = err.to_block_reason();
+        let round_tripped = GuardError::from_block_reason(&reason);
+        assert_eq!(
+            Some(err),
+            round_tripped,
+            "failed round trip for error {err:?} with symbol {reason:?}"
+        );
+    }
+}
+
+#[test]
+fn agent_runtime_lifecycle_simulation_continuous_heartbeat_loop_and_spends() {
+    let mut h = Harness::new();
+    let recv = h.recv.clone();
+    let mut policy = h.base_policy();
+    policy.window_secs = 100;
+    policy.window_cap = 100;
+    policy.dms_grace_secs = 50;
+
+    let mut now = 1_000_000u64;
+    h.set_time(now);
+    h.install_policy(&policy);
+
+    // Span ≥3 window periods and ≥5 heartbeats
+    // Window is 100s, so 3 windows = 300s. Let's run for 350s with heartbeats every 40s (total 9 heartbeats).
+    for _i in 0..9 {
+        h.set_time(now);
+        h.heartbeat();
+
+        // Spend some budget within caps (e.g. 20 per heartbeat)
+        h.set_time(now + 5);
+        h.transfer(&recv, 20);
+
+        now += 40;
+    }
+
+    // Verify budget recovery across rolled-out windows: windows have rolled, so we can spend again despite prior cumulative totals.
+    h.set_time(now);
+    h.heartbeat();
+    h.set_time(now + 5);
+    h.transfer(&recv, 30);
+
+    // Stop heartbeats and assert freeze at grace expiry
+    // Last heartbeat was at roughly now - 40. Grace is 50s. Advancing time by 60s should expire grace.
+    now += 60;
+    h.set_time(now);
+    let st = h.status();
+    assert!(
+        st.heartbeat_expired,
+        "heartbeat should have expired after grace"
+    );
+
+    // Assert transfers and heartbeats are frozen
+    h.transfer_expect_blocked(&recv, 10);
+    h.heartbeat_expect_blocked();
+
+    // Unfreeze
+    h.unfreeze();
+    let st_after = h.status();
+    assert!(!st_after.heartbeat_expired, "guard should be unfreezed");
+
+    // Resume normal ops
+    h.set_time(now + 10);
+    h.heartbeat();
+    h.transfer(&recv, 10);
+}
+
+#[test]
+fn policy_config_debug_snapshot() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let asset_a = Address::generate(&env);
+    let asset_b = Address::generate(&env);
+    let proto_a = Address::generate(&env);
+    let proto_b = Address::generate(&env);
+    let recip_a = Address::generate(&env);
+    let recip_b = Address::generate(&env);
+
+    let config = PolicyConfig {
+        per_tx_cap: 1000,
+        window_secs: 86_400,
+        window_cap: 50_000,
+        assets: vec![&env, asset_a.clone(), asset_b],
+        protocols: vec![
+            &env,
+            ProtocolRule {
+                contract: proto_a,
+                fns: Some(vec![&env, Symbol::new(&env, "swap")]),
+            },
+            ProtocolRule {
+                contract: proto_b,
+                fns: None,
+            },
+        ],
+        recipients: vec![&env, recip_a, recip_b],
+        allow_any_recipient: false,
+        active_from: 1_700_000_000,
+        active_until: 1_800_000_000,
+        paused: true,
+        dms_grace_secs: 3600,
+    };
+
+    let debug_output = format!("{config:?}");
+
+    let fields = [
+        "per_tx_cap",
+        "window_secs",
+        "window_cap",
+        "assets",
+        "protocols",
+        "recipients",
+        "allow_any_recipient",
+        "active_from",
+        "active_until",
+        "paused",
+        "dms_grace_secs",
+    ];
+
+    let mut last_pos = 0;
+    for field in fields {
+        let pos = debug_output
+            .find(field)
+            .unwrap_or_else(|| panic!("field {field} not found in debug output"));
+        assert!(
+            pos >= last_pos,
+            "field {field} appears before previous field (order: {fields:?})"
+        );
+        last_pos = pos;
+    }
 }

@@ -315,6 +315,17 @@ host invokes it automatically on every authorization the account must approve. S
 
 See [How it works](#how-it-works) below for the full flow through `parse_call`/`decide`.
 
+## Troubleshooting — Submission Errors
+
+When submitting transactions via `agent-tx` (run `agent-tx --help` for usage and troubleshooting reference) or the RPC, submission failures are mapped to actionable operator guidance. Common submission error classes and their exact fixes:
+
+| Error Class / Code | What Happened | Exact Flag / Remediation | SPEC Ref / Notes |
+|---|---|---|---|
+| `tx_insufficient_fee` / `insufficient` | The transaction inclusion fee or resource fee was lower than the network minimum or insufficient to cover the footprint. | Resubmit with a higher fee or use `--fee-multiplier <VAL>` (or bump resource fee / inclusion fee) to satisfy network pricing. | Stellar Core transaction pre-check |
+| `tx_bad_seq` / `seq` | Sequence number collision or mismatch. The source account sequence has advanced or needs a refresh. | Fetch the latest account sequence from RPC (`agent-tx` fetches this automatically on run) and resubmit with the correct sequence. | Stellar Core sequence check |
+| `tx_too_early` | Transaction precondition ledger bounds are not yet met (ledger time is before `min_ledger`). | Wait for the next ledger or check node time synchronization. | Preconditions check |
+| `tx_late_expiration` | Transaction or signature expiration ledger has passed (`max_ledger` or `signature_expiration_ledger`). | Increase the signature expiration ledger delta (`--sig-expiration-ledgers <VAL>`) and resubmit. | Signature expiration check |
+
 ## Installation
 
 ### Prerequisites
@@ -559,6 +570,23 @@ and a review approved for changes to merge.
 
 - [Telegram](https://t.me/+EzSusj-2vVhhNmI0)
 - [Discord](https://discord.gg/Z766vsgjg)
+
+## Which repository? — Decision table for cross-repo questions
+
+Stellar Agent Guard spans three repositories. Use this table to file issues in the right place.
+
+| Symptom / Question | Repository | Issue Template |
+|---|---|---|
+| My transfer is blocked unexpectedly / spend caps not working | [stellar-agent-guard-contracts](https://github.com/aigbagbobila/stellar-agent-guard-contracts) | [Bug report](https://github.com/aigbagbobila/stellar-agent-guard-contracts/issues/new?template=bug_report.yml) |
+| Middleware/SDK throws wrong error / pre-flight check mismatch | [stellar-agent-guard-sdk](https://github.com/aigbagbobila/stellar-agent-guard-sdk) | [Bug report](https://github.com/aigbagbobila/stellar-agent-guard-sdk/issues/new?template=bug_report.yml) |
+| Panic button won't confirm / dashboard UI issue | [stellar-agent-guard-dashboard](https://github.com/aigbagbobila/stellar-agent-guard-dashboard) | [Bug report](https://github.com/aigbagbobila/stellar-agent-guard-dashboard/issues/new?template=bug_report.yml) |
+| Policy encode/decode mismatch between contract and SDK | [stellar-agent-guard-contracts](https://github.com/aigbagbobila/stellar-agent-guard-contracts) + [stellar-agent-guard-sdk](https://github.com/aigbagbobila/stellar-agent-guard-sdk) | File in both (link each other) |
+| Dead-man switch / heartbeat not firing as expected | [stellar-agent-guard-contracts](https://github.com/aigbagbobila/stellar-agent-guard-contracts) | [Bug report](https://github.com/aigbagbobila/stellar-agent-guard-contracts/issues/new?template=bug_report.yml) |
+| Agent transaction signing / auth entry construction failing | [stellar-agent-guard-sdk](https://github.com/aigbagbobila/stellar-agent-guard-sdk) | [Bug report](https://github.com/aigbagbobila/stellar-agent-guard-sdk/issues/new?template=bug_report.yml) |
+| Contract deployment / initialization / admin functions | [stellar-agent-guard-contracts](https://github.com/aigbagbobila/stellar-agent-guard-contracts) | [Bug report](https://github.com/aigbagbobila/stellar-agent-guard-contracts/issues/new?template=bug_report.yml) |
+| Dashboard not showing correct policy state / events | [stellar-agent-guard-dashboard](https://github.com/aigbagbobila/stellar-agent-guard-dashboard) | [Bug report](https://github.com/aigbagbobila/stellar-agent-guard-dashboard/issues/new?template=bug_report.yml) |
+
+> **Note:** If unsure, file in **stellar-agent-guard-contracts** — maintainers will triage and redirect.
 
 ## Contact
 

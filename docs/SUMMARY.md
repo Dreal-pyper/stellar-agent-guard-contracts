@@ -16,5 +16,7 @@
 * [Architecture](architecture.md)
 * [Testnet Verification](verification.md)
 * [Enforcement Scope](enforcement-scope.md)
+* [Reason Glossary](reason-glossary.md)
+* [Audit Pack](audit-pack.md)
 * [Contributing](contributing.md)
 * [FAQ](faq.md)

@@ -339,6 +339,32 @@ pub fn initialize(env: Env, admin: Address, agent_pubkey: BytesN<32>)
     // require_auth(admin). Exactly once (AlreadyInitialized otherwise). Stores
     // Admin and AgentPubkey; no policy yet -> account is default-deny until set_policy.
 
+### 7.1 Error code ↔ CheckResult variant ↔ reason symbol mapping
+
+To close the CheckResult/Error duality gap, every contract `Error` variant maps 1:1 to a `BlockReason` symbol emitted in `CheckResult::Blocked` and `auth_checked` events. The table below records the complete correspondence, including auth-only or admin-only variants that are unreachable via `check()` pre-flight reads and their rationale.
+
+| Error Code | Error Variant | Reason Symbol (`CheckResult::Blocked`) | Reachable via `check()`? | Rationale for Unreachable Direction |
+|---|---|---|---|---|
+| 1 | `Unauthorized` | `unauthorized` | No | Auth-path only: signature validation or admin auth failure traps before policy check. |
+| 2 | `AlreadyInitialized` | `already_initialized` | No | Admin lifecycle op: initialize is run once during deployment setup, not a check parameter. |
+| 3 | `NotInitialized` | `not_initialized` | Yes | Pre-activation guard check. |
+| 4 | `InvalidConfig` | `invalid_config` | No | Admin op: `set_policy` validation error; policies are not passed into `check()`. |
+| 5 | `InvalidAmount` | `invalid_amount` | Yes | Checked directly in `check()` input arguments. |
+| 10 | `AdminFrozen` | `admin_frozen` | Yes | Account-level gate evaluated in `check()`. |
+| 11 | `HeartbeatExpired` | `heartbeat_expired` | Yes | Account-level dead-man switch gate evaluated in `check()`. |
+| 12 | `NoPolicy` | `no_policy` | Yes | Account-level gate evaluated in `check()`. |
+| 13 | `Paused` | `paused` | Yes | Account-level gate evaluated in `check()`. |
+| 14 | `OutsideActiveWindow` | `outside_active_window` | Yes | Account-level gate evaluated in `check()`. |
+| 20 | `AssetNotAllowed` | `asset_not_allowed` | Yes | Evaluated in `check()` asset parameter validation. |
+| 21 | `RecipientNotAllowed` | `recipient_not_allowed` | Yes | Evaluated in `check()` recipient parameter validation. |
+| 22 | `PerTxCapExceeded` | `per_tx_cap_exceeded` | Yes | Evaluated against `check()` amount parameter. |
+| 23 | `WindowCapExceeded` | `window_cap_exceeded` | Yes | Evaluated against rolling window ledger in `check()`. |
+| 24 | `ProtocolNotAllowed` | `protocol_not_allowed` | No | Auth-path only: non-SAC protocol calls do not use `check()`. |
+| 25 | `FunctionNotAllowed` | `function_not_allowed` | No | Auth-path only: restricted functions apply to auth contexts, not `check()`. |
+| 26 | `UnknownContract` | `unknown_contract` | No | Auth-path only: unlisted contracts are encountered in auth contexts. |
+| 27 | `SelfFunctionNotAllowed` | `self_function_not_allowed` | No | Auth-path only: self-calls are part of `__check_auth` context dispatch. |
+| 28 | `CreateContractNotAllowed` | `create_contract_not_allowed` | No | Auth-path only: contract creation host functions occur in auth contexts.
+
 // ── Policy management (admin only) ────────────────────────────────────────
 pub fn set_policy(env: Env, config: PolicyConfig)
     // require_auth(Admin). Validates config (§8). Replaces Policy and resets
@@ -360,6 +386,7 @@ pub fn unfreeze(env: Env)    // require_auth(Admin); clears AdminFrozen, LastHea
 // ── Read / advisory (no auth — safe reads only, nothing confidential) ─────
 pub fn policy(env: Env) -> Option<PolicyConfig>       // current policy
 pub fn status(env: Env) -> Status                     // frozen? admin_frozen? last_heartbeat? now?
+pub fn dms_health(env: Env) -> DmsHealth                  // ok, warn (>=80%), or expired
 pub fn check(env: Env, asset: Address, to: Address, amount: i128) -> CheckResult
     // Pure pre-flight replica of the §6.2 decision path (same code, no writes):
     // lets agents/SDK simulate an asset transfer before signing. Emits the same
@@ -390,6 +417,17 @@ pub struct Status { pub admin_frozen: bool, pub heartbeat_expired: bool,
                    pub policy_revision: u64 }
 
 #[contracttype]
+pub enum DmsHealthStatus { Ok, Warn, Expired }
+
+#[contracttype]
+pub struct DmsHealth {
+    pub status: DmsHealthStatus,
+    pub elapsed_secs: u64,
+    pub grace_secs: u64,
+    pub threshold_secs: u64,
+}
+
+#[contracttype]
 pub enum CheckResult { Allowed, Blocked(BlockReason) }
 
 #[contracttype]
@@ -410,6 +448,7 @@ pub enum Error {            // values stable; see tests/fixtures
     AssetNotAllowed = 20, RecipientNotAllowed = 21, PerTxCapExceeded = 22,
     WindowCapExceeded = 23, ProtocolNotAllowed = 24, FunctionNotAllowed = 25,
     UnknownContract = 26, SelfFunctionNotAllowed = 27,
+    CreateContractNotAllowed = 28,
 }
 ```
 
@@ -444,12 +483,21 @@ filtering by the SDK listener.
 
 | Event | Topics | Data | Emitted |
 |---|---|---|---|
-| `auth_checked` | `result: Symbol` (`allowed`/`blocked`), `reason: Symbol` | — | every `__check_auth` / `check` decision |
-| `heartbeat` | — | `at: u64` | on agent heartbeat (skipped when `now == LastHeartbeat`; §5) |
-| `frozen` / `unfrozen` | — | `by: Address` | admin freeze / unfreeze |
-| `policy_set` / `policy_revoked` | — | `by: Address` | admin policy changes |
+| `auth_checked` | `result: Symbol` (`allowed`/`blocked`), `reason: Symbol` | (none) | every `__check_auth` / `check` decision |
+| `heartbeat` | (none) | `at: u64` | on agent heartbeat (skipped when `now == LastHeartbeat`; §5) |
+| `initialized` | (none) | `by: Address` | contract initialization |
+| `frozen` / `unfrozen` | (none) | `by: Address` | admin freeze / unfreeze |
+| `policy_set` / `policy_revoked` | (none) | `by: Address` | admin policy changes |
+| `agent_rotated` | (none) | `by: Address`, `old_fingerprint: BytesN<8>`, `new_fingerprint: BytesN<8>` | admin agent-key rotation |
 
 Reason symbols mirror `BlockReason`/`Error` naming so off-chain code maps one vocabulary.
+
+**Key fingerprints (`agent_rotated`).** A fingerprint is `sha256(pubkey)[0..8]` — the first
+8 bytes of the SHA-256 digest of the agent public key, rendered as 16 lowercase hex characters
+off-chain. Rotations record both endpoints (outgoing and incoming) so an auditor can reconstruct
+"when did key K stop being authoritative" from the append-only event log; the full public key is
+never repeated in event data (it is already public at `initialize`). SDK/dashboard decoders must
+render the `BytesN<8>` data fields as hex — a cross-repo follow-up tracked in those repositories.
 
 ---
 
